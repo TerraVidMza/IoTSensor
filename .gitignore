@@ -1,0 +1,22 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/.browse.c_cpp.db*
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch
+
+# Config con secretos (WiFi + API key) — nunca se commitea.
+# Ver include/config.example.h para la plantilla.
+include/config.h
+
+# Simulador (Python) — .env tiene BACKEND_URL e IOT_API_KEY, no se commitea.
+simulador/.env
+simulador/__pycache__/
+simulador/.venv/
+simulador/*.pyc
+
+# Editor / SO
+.DS_Store
+*.log
