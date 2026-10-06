@@ -2,17 +2,28 @@
 //
 // Lee temperatura y humedad ambiente (DHT22) y humedad de suelo (sensor
 // capacitivo analogico), y envia cada variable como una lectura independiente
-// a POST /api/lecturas-iot del backend (HU-19), autenticando con la API key
-// estatica del canal de dispositivos (header X-Api-Key, HU-19 + ApiKeyGuard).
+// al backend por MQTT (si MQTT_BROKER_URL esta definido en config.h) o por
+// HTTP como respaldo.
 //
-// Contrato exacto esperado por el backend (ver
-// Backend/src/modules/lecturas-iot/dto/ingest-lectura.dto.ts):
+// Transporte preferido: MQTTS (TLS, puerto 8883). El broker Mosquitto usa
+// dynamic security (D-026): cada sensor tiene su propio usuario y password y
+// solo puede publicar en su topico. Un nodo con 3 sensores hace 3 conexiones
+// MQTT separadas, una por credencial. Si el broker no esta configurado o no
+// responde, el firmware cae a HTTP.
+//
+// Contrato MQTT (ver docs/IOT-MQTT.md del Backend):
+//   Topico: terravid/sensores/{codigo}/lecturas
+//   QoS: 1 (al menos una vez)
+//   Payload JSON: { "valor": number, "unidad": string,
+//                   "sensorTimestamp": string ISO 8601 }
+//   El codigoSensor NO va en el payload MQTT — sale del topico autenticado.
+//
+// Contrato HTTP de respaldo (ver HU-19):
 //   POST /api/lecturas-iot
 //   Header: X-Api-Key: <IOT_API_KEY>
 //   Body JSON: { "codigoSensor": string, "valor": number, "unidad": string,
 //                "sensorTimestamp": string ISO 8601 }
 //   Respuestas: 201 ingerida | 404 sensor no registrado | 403 sensor inactivo
-//               | 400 fuera de rango fisico (queda en lecturas_anomalas)
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -22,6 +33,11 @@
 #include <time.h>
 
 #include "config.h"
+
+#ifdef MQTT_BROKER_URL
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#endif
 
 DHT dht(PIN_DHT22, DHT22);
 
@@ -84,17 +100,155 @@ String timestampIso8601Utc() {
   return String(buffer);
 }
 
-// --- Envio de una lectura ---
+// =============================================================================
+// Transporte MQTT (solo si MQTT_BROKER_URL esta definido en config.h)
+// =============================================================================
 
-bool enviarLectura(const char *codigoSensor, float valor, const char *unidad) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Sin WiFi: se descarta la lectura de este ciclo.");
+#ifdef MQTT_BROKER_URL
+
+// Datos de un cliente MQTT independiente para un sensor.
+// Cada sensor tiene su propio usuario y puede publicar solo en su topico.
+struct ClienteMqtt {
+  const char* usuario;
+  const char* password;
+  WiFiClientSecure clienteSeguro;
+  WiFiClient clientePlano;
+  PubSubClient* cliente = nullptr;
+};
+
+// Un cliente MQTT por sensor. El broker rechazaria publicaciones cruzadas
+// (un usuario publicando en el topico de otro sensor — D-026).
+static ClienteMqtt mqttTemperatura   { MQTT_USUARIO_TEMPERATURA,   MQTT_PASSWORD_TEMPERATURA };
+static ClienteMqtt mqttHumedadAmb    { MQTT_USUARIO_HUMEDAD_AMB,   MQTT_PASSWORD_HUMEDAD_AMB };
+static ClienteMqtt mqttHumedadSuelo  { MQTT_USUARIO_HUMEDAD_SUELO, MQTT_PASSWORD_HUMEDAD_SUELO };
+
+static bool mqttUsaTls = true;
+static String mqttHost;
+static uint16_t mqttPuerto;
+static bool mqttInicializado = false;
+
+// Parsea "mqtts://host:puerto" o "mqtt://host:puerto".
+bool parsearBrokerUrl(const char* url, String& host, uint16_t& puerto, bool& tls) {
+  String s(url);
+  if (s.startsWith("mqtts://")) {
+    tls = true;
+    s = s.substring(8);
+  } else if (s.startsWith("mqtt://")) {
+    tls = false;
+    s = s.substring(7);
+  } else {
     return false;
   }
+  int sep = s.lastIndexOf(':');
+  if (sep < 0) {
+    host = s;
+    puerto = tls ? 8883 : 1883;
+  } else {
+    host = s.substring(0, sep);
+    puerto = static_cast<uint16_t>(s.substring(sep + 1).toInt());
+  }
+  return true;
+}
 
-  const String timestamp = timestampIso8601Utc();
-  if (timestamp.isEmpty()) {
-    Serial.println("Reloj no sincronizado: se descarta la lectura de este ciclo.");
+/** Prepara el PubSubClient de un sensor (no conecta aun). */
+void inicializarClienteMqtt(ClienteMqtt& cm) {
+  if (mqttUsaTls) {
+    // setInsecure() acepta cualquier cert valido de Let's Encrypt sin
+    // tener que incrustar el PEM de la CA raiz en el firmware.
+    // Para pinning estricto: cm.clienteSeguro.setCACert(ISRG_ROOT_X1_PEM)
+    cm.clienteSeguro.setInsecure();
+    cm.cliente = new PubSubClient(cm.clienteSeguro);
+  } else {
+    cm.cliente = new PubSubClient(cm.clientePlano);
+  }
+  cm.cliente->setServer(mqttHost.c_str(), mqttPuerto);
+  cm.cliente->setKeepAlive(60);
+}
+
+/** Inicializa todos los clientes MQTT. Se llama una vez en setup(). */
+void inicializarMqtt() {
+  if (!parsearBrokerUrl(MQTT_BROKER_URL, mqttHost, mqttPuerto, mqttUsaTls)) {
+    Serial.printf("MQTT_BROKER_URL invalida: \"%s\". Se usara solo HTTP.\n", MQTT_BROKER_URL);
+    return;
+  }
+  Serial.printf("MQTT %s -> %s:%u\n", mqttUsaTls ? "TLS" : "sin TLS",
+                mqttHost.c_str(), mqttPuerto);
+
+  inicializarClienteMqtt(mqttTemperatura);
+  inicializarClienteMqtt(mqttHumedadAmb);
+  inicializarClienteMqtt(mqttHumedadSuelo);
+  mqttInicializado = true;
+}
+
+/**
+ * Conecta (o reconecta) un cliente MQTT al broker.
+ * Cada sensor se autentica con su propio usuario: el broker lo limita
+ * a publicar solo en su topico (D-026).
+ */
+bool conectarClienteMqtt(ClienteMqtt& cm) {
+  if (!mqttInicializado || !cm.cliente) return false;
+  if (cm.cliente->connected()) return true;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  const String clientId = String(cm.usuario) + "-" + String(random(0xffff), HEX);
+  const bool ok = cm.cliente->connect(clientId.c_str(), cm.usuario, cm.password);
+  if (!ok) {
+    Serial.printf("  [%s] broker rechazo la conexion (estado=%d)\n",
+                  cm.usuario, cm.cliente->state());
+  }
+  return ok;
+}
+
+/**
+ * Publica una lectura por MQTT (QoS 1) usando el cliente propio del sensor.
+ *
+ * El codigoSensor NO va en el payload: sale del topico, que identifica al
+ * sensor autenticado (D-026). El backend ignora codigoSensor en el payload
+ * MQTT aunque estuviera presente.
+ */
+bool publicarPorMqtt(ClienteMqtt& cm, const char* codigoSensor,
+                     float valor, const char* unidad, const String& timestamp) {
+  if (!conectarClienteMqtt(cm)) return false;
+
+  JsonDocument payload;
+  payload["valor"] = valor;
+  payload["unidad"] = unidad;
+  payload["sensorTimestamp"] = timestamp;
+
+  String cuerpo;
+  serializeJson(payload, cuerpo);
+
+  const String topico = String("terravid/sensores/") + codigoSensor + "/lecturas";
+  const bool ok = cm.cliente->publish(topico.c_str(), cuerpo.c_str(), /* retain= */ false);
+
+  Serial.printf("[MQTT] [%s] %s = %.2f %s -> %s\n",
+                timestamp.c_str(), codigoSensor, valor, unidad,
+                ok ? "publicado" : "fallo (cae a HTTP)");
+  return ok;
+}
+
+/** Llama a loop() de cada cliente para mantener keepalive y procesar ACKs de QoS 1. */
+void loopMqtt() {
+  if (!mqttInicializado) return;
+  if (mqttTemperatura.cliente  && mqttTemperatura.cliente->connected())  mqttTemperatura.cliente->loop();
+  if (mqttHumedadAmb.cliente   && mqttHumedadAmb.cliente->connected())   mqttHumedadAmb.cliente->loop();
+  if (mqttHumedadSuelo.cliente && mqttHumedadSuelo.cliente->connected()) mqttHumedadSuelo.cliente->loop();
+}
+
+#endif  // MQTT_BROKER_URL
+
+// =============================================================================
+// Transporte HTTP (respaldo, o unico si MQTT no esta configurado)
+// =============================================================================
+
+/**
+ * Envia una lectura por HTTP POST (HU-19).
+ * Se usa cuando MQTT no esta configurado o cuando el broker no responde.
+ */
+bool enviarPorHttp(const char* codigoSensor, float valor, const char* unidad,
+                   const String& timestamp) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Sin WiFi: se descarta la lectura de este ciclo.");
     return false;
   }
 
@@ -118,18 +272,47 @@ bool enviarLectura(const char *codigoSensor, float valor, const char *unidad) {
   const String respuesta = http.getString();
   http.end();
 
-  Serial.printf("[%s] %s = %.2f %s -> HTTP %d\n", timestamp.c_str(), codigoSensor, valor, unidad, status);
+  Serial.printf("[HTTP] [%s] %s = %.2f %s -> HTTP %d\n",
+                timestamp.c_str(), codigoSensor, valor, unidad, status);
 
   if (status == 201) {
     return true;
   }
 
   // 404 (sensor no dado de alta), 403 (sensor inactivo) y 400 (fuera de rango
-  // fisico) son errores de configuracion o de calibracion, no de red: no
-  // tiene sentido reintentar en caliente, pero se loguea el detalle para
-  // poder diagnosticar sin acceso al backend.
+  // fisico) son errores de configuracion o de calibracion, no de red.
   Serial.printf("  Respuesta: %s\n", respuesta.c_str());
   return false;
+}
+
+// =============================================================================
+// Envio con seleccion de transporte
+// =============================================================================
+
+/**
+ * Intenta MQTT con el cliente del sensor; si falla, cae a HTTP.
+ * Sin MQTT configurado, va directo a HTTP.
+ */
+bool enviarLectura(
+#ifdef MQTT_BROKER_URL
+    ClienteMqtt& clienteMqtt,
+#endif
+    const char* codigoSensor, float valor, const char* unidad) {
+
+  const String timestamp = timestampIso8601Utc();
+  if (timestamp.isEmpty()) {
+    Serial.println("Reloj no sincronizado: se descarta la lectura de este ciclo.");
+    return false;
+  }
+
+#ifdef MQTT_BROKER_URL
+  if (publicarPorMqtt(clienteMqtt, codigoSensor, valor, unidad, timestamp)) {
+    return true;
+  }
+  Serial.println("  Reintentando por HTTP...");
+#endif
+
+  return enviarPorHttp(codigoSensor, valor, unidad, timestamp);
 }
 
 // --- Lecturas por variable ---
@@ -143,8 +326,17 @@ void leerYEnviarDht() {
     return;
   }
 
-  enviarLectura(CODIGO_SENSOR_TEMPERATURA, temperatura, "°C");
-  enviarLectura(CODIGO_SENSOR_HUMEDAD_AMBIENTE, humedad, "%");
+  enviarLectura(
+#ifdef MQTT_BROKER_URL
+      mqttTemperatura,
+#endif
+      CODIGO_SENSOR_TEMPERATURA, temperatura, "°C");
+
+  enviarLectura(
+#ifdef MQTT_BROKER_URL
+      mqttHumedadAmb,
+#endif
+      CODIGO_SENSOR_HUMEDAD_AMBIENTE, humedad, "%");
 }
 
 void leerYEnviarHumedadSuelo() {
@@ -156,7 +348,11 @@ void leerYEnviarHumedadSuelo() {
   long porcentaje = map(lecturaCruda, ADC_HUMEDAD_SUELO_SECO, ADC_HUMEDAD_SUELO_EMPAPADO, 0, 100);
   porcentaje = constrain(porcentaje, 0, 100);
 
-  enviarLectura(CODIGO_SENSOR_HUMEDAD_SUELO, static_cast<float>(porcentaje), "%");
+  enviarLectura(
+#ifdef MQTT_BROKER_URL
+      mqttHumedadSuelo,
+#endif
+      CODIGO_SENSOR_HUMEDAD_SUELO, static_cast<float>(porcentaje), "%");
 }
 
 // --- Ciclo principal ---
@@ -166,17 +362,31 @@ void setup() {
   delay(1000);
   Serial.println("\nTerraVid IoT — arrancando nodo de telemetria");
 
+#ifdef MQTT_BROKER_URL
+  Serial.println("Transporte: MQTT (con HTTP como respaldo)");
+#else
+  Serial.println("Transporte: HTTP");
+#endif
+
   dht.begin();
   analogReadResolution(12); // ADC del ESP32: 0-4095
 
   conectarWifi();
   if (WiFi.status() == WL_CONNECTED) {
     sincronizarReloj();
+#ifdef MQTT_BROKER_URL
+    inicializarMqtt();
+#endif
   }
 }
 
 void loop() {
   conectarWifi(); // no-op si ya esta conectado; reintenta si se cayo
+
+#ifdef MQTT_BROKER_URL
+  // PubSubClient necesita loop() periodico para keepalive y ACKs de QoS 1.
+  loopMqtt();
+#endif
 
   if (WiFi.status() == WL_CONNECTED) {
     leerYEnviarDht();

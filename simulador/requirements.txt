@@ -1,2 +1,4 @@
 requests>=2.31
 python-dotenv>=1.0
+# MQTT (canal preferido, D-026): requerido para --transport mqtt
+paho-mqtt>=2.0
