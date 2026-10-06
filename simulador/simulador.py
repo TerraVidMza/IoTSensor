@@ -213,9 +213,25 @@ def crear_cliente_mqtt(mqtt_url: str, usuario: str, password: str, ca_cert: str)
         host = host_port
         puerto = 8883 if tls else 1883
 
-    client = mqtt.Client(client_id=f"simulador-{usuario}-{random.randint(0, 0xFFFF):04x}",
-                         protocol=mqtt.MQTTv311)
+    # MQTT 5 y no 3.1.1: en 3.1.1 el broker confirma (PUBACK) una publicación
+    # que la ACL rechazó y la descarta en silencio, y el simulador la contaba
+    # como enviada. En MQTT 5 el PUBACK trae el motivo ("Not authorized").
+    client = mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        client_id=f"simulador-{usuario}-{random.randint(0, 0xFFFF):04x}",
+        protocol=mqtt.MQTTv5,
+    )
     client.username_pw_set(usuario, password)
+    client.user_data_set({"puback": {}, "conectado": None})
+
+    def al_conectar(cli, datos, flags, reason_code, properties):
+        datos["conectado"] = reason_code
+
+    def al_publicar(cli, datos, mid, reason_code, properties):
+        datos["puback"][mid] = reason_code
+
+    client.on_connect = al_conectar
+    client.on_publish = al_publicar
 
     if tls:
         import ssl
@@ -230,10 +246,21 @@ def crear_cliente_mqtt(mqtt_url: str, usuario: str, password: str, ca_cert: str)
     try:
         client.connect(host, puerto, keepalive=60)
         client.loop_start()
-        return client
     except Exception as error:
         print(f"No se pudo conectar al broker MQTT {host}:{puerto}: {error}")
         return None
+
+    # connect() vuelve antes de que el broker acepte o rechace las credenciales.
+    datos = client.user_data_get()
+    for _ in range(50):
+        if datos["conectado"] is not None:
+            break
+        time.sleep(0.1)
+    if datos["conectado"] is None or datos["conectado"].is_failure:
+        print(f"  [{usuario}] El broker rechazó la conexión: {datos['conectado']}")
+        client.loop_stop()
+        return None
+    return client
 
 
 # Pool de clientes MQTT: uno por sensor (cada sensor tiene sus propias credenciales)
@@ -285,13 +312,14 @@ def enviar_por_mqtt(sensor: dict, valor: float, unidad: str) -> bool:
     try:
         result = client.publish(topico, _json.dumps(payload), qos=1)
         result.wait_for_publish(timeout=5)
-        ok = result.rc == 0
     except Exception as error:
         print(f"  [{codigo}] Error al publicar por MQTT: {error}")
         return False
 
+    motivo = client.user_data_get()["puback"].pop(result.mid, None)
+    ok = result.rc == 0 and motivo is not None and not motivo.is_failure
     marca = "OK" if ok else "!!"
-    print(f"[MQTT {marca}] {codigo} = {payload['valor']} {unidad} -> rc={result.rc}")
+    print(f"[MQTT {marca}] {codigo} = {payload['valor']} {unidad} -> {motivo or 'sin confirmación'}")
     return ok
 
 

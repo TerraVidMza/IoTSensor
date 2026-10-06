@@ -7,13 +7,19 @@
 //
 // Transporte preferido: MQTTS (TLS, puerto 8883). El broker Mosquitto usa
 // dynamic security (D-026): cada sensor tiene su propio usuario y password y
-// solo puede publicar en su topico. Un nodo con 3 sensores hace 3 conexiones
-// MQTT separadas, una por credencial. Si el broker no esta configurado o no
-// responde, el firmware cae a HTTP.
+// solo puede publicar en su topico. Un nodo con 3 sensores usa 3 credenciales.
+// En cada ciclo cada sensor se conecta, publica y se desconecta: el nodo
+// duerme 5 minutos entre lecturas, mucho mas que el keepalive, y una conexion
+// que el broker ya cerro puede aceptar un publish sin que el dato llegue.
+// Si el broker no esta configurado o no responde, el firmware cae a HTTP.
+//
+// TLS verificado contra las raices de Let's Encrypt (include/certificados_ca.h)
+// tanto para MQTTS como para el respaldo HTTPS.
 //
 // Contrato MQTT (ver docs/IOT-MQTT.md del Backend):
 //   Topico: terravid/sensores/{codigo}/lecturas
-//   QoS: 1 (al menos una vez)
+//   QoS: 0. PubSubClient no publica con QoS 1; la confirmacion de entrega la
+//   da la reconexion en cada ciclo y, si falla, el respaldo HTTP.
 //   Payload JSON: { "valor": number, "unidad": string,
 //                   "sensorTimestamp": string ISO 8601 }
 //   El codigoSensor NO va en el payload MQTT — sale del topico autenticado.
@@ -33,6 +39,7 @@
 #include <time.h>
 
 #include "config.h"
+#include "certificados_ca.h"
 
 #ifdef MQTT_BROKER_URL
 #include <WiFiClientSecure.h>
@@ -109,6 +116,11 @@ String timestampIso8601Utc() {
 // Datos de un cliente MQTT independiente para un sensor.
 // Cada sensor tiene su propio usuario y puede publicar solo en su topico.
 struct ClienteMqtt {
+  // Constructor explicito: con el C++ de la toolchain del ESP32, el
+  // inicializador por defecto de `cliente` impedia la inicializacion con
+  // llaves y el firmware no compilaba con MQTT_BROKER_URL definido.
+  ClienteMqtt(const char* u, const char* p) : usuario(u), password(p) {}
+
   const char* usuario;
   const char* password;
   WiFiClientSecure clienteSeguro;
@@ -153,16 +165,17 @@ bool parsearBrokerUrl(const char* url, String& host, uint16_t& puerto, bool& tls
 /** Prepara el PubSubClient de un sensor (no conecta aun). */
 void inicializarClienteMqtt(ClienteMqtt& cm) {
   if (mqttUsaTls) {
-    // setInsecure() acepta cualquier cert valido de Let's Encrypt sin
-    // tener que incrustar el PEM de la CA raiz en el firmware.
-    // Para pinning estricto: cm.clienteSeguro.setCACert(ISRG_ROOT_X1_PEM)
-    cm.clienteSeguro.setInsecure();
+    // Verifica el certificado del broker contra las raices de Let's Encrypt:
+    // con setInsecure() cualquiera en el camino podia hacerse pasar por el
+    // broker y quedarse con la contrasena del sensor.
+    cm.clienteSeguro.setCACert(RAICES_CA_PEM);
     cm.cliente = new PubSubClient(cm.clienteSeguro);
   } else {
     cm.cliente = new PubSubClient(cm.clientePlano);
   }
   cm.cliente->setServer(mqttHost.c_str(), mqttPuerto);
-  cm.cliente->setKeepAlive(60);
+  cm.cliente->setKeepAlive(30);
+  cm.cliente->setSocketTimeout(10);
 }
 
 /** Inicializa todos los clientes MQTT. Se llama una vez en setup(). */
@@ -187,8 +200,9 @@ void inicializarMqtt() {
  */
 bool conectarClienteMqtt(ClienteMqtt& cm) {
   if (!mqttInicializado || !cm.cliente) return false;
-  if (cm.cliente->connected()) return true;
   if (WiFi.status() != WL_CONNECTED) return false;
+  // Siempre una conexion nueva: la del ciclo anterior ya fue cerrada.
+  if (cm.cliente->connected()) cm.cliente->disconnect();
 
   const String clientId = String(cm.usuario) + "-" + String(random(0xffff), HEX);
   const bool ok = cm.cliente->connect(clientId.c_str(), cm.usuario, cm.password);
@@ -200,7 +214,8 @@ bool conectarClienteMqtt(ClienteMqtt& cm) {
 }
 
 /**
- * Publica una lectura por MQTT (QoS 1) usando el cliente propio del sensor.
+ * Publica una lectura por MQTT (QoS 0) con la credencial propia del sensor:
+ * conecta, publica y desconecta.
  *
  * El codigoSensor NO va en el payload: sale del topico, que identifica al
  * sensor autenticado (D-026). El backend ignora codigoSensor en el payload
@@ -219,20 +234,17 @@ bool publicarPorMqtt(ClienteMqtt& cm, const char* codigoSensor,
   serializeJson(payload, cuerpo);
 
   const String topico = String("terravid/sensores/") + codigoSensor + "/lecturas";
-  const bool ok = cm.cliente->publish(topico.c_str(), cuerpo.c_str(), /* retain= */ false);
+  bool ok = cm.cliente->publish(topico.c_str(), cuerpo.c_str(), /* retain= */ false);
+  // loop() vacia el buffer de salida y detecta si el broker corto la conexion
+  // (por ejemplo, una ACL que rechaza el topico). Recien despues se desconecta.
+  cm.cliente->loop();
+  ok = ok && cm.cliente->connected();
+  cm.cliente->disconnect();
 
   Serial.printf("[MQTT] [%s] %s = %.2f %s -> %s\n",
                 timestamp.c_str(), codigoSensor, valor, unidad,
                 ok ? "publicado" : "fallo (cae a HTTP)");
   return ok;
-}
-
-/** Llama a loop() de cada cliente para mantener keepalive y procesar ACKs de QoS 1. */
-void loopMqtt() {
-  if (!mqttInicializado) return;
-  if (mqttTemperatura.cliente  && mqttTemperatura.cliente->connected())  mqttTemperatura.cliente->loop();
-  if (mqttHumedadAmb.cliente   && mqttHumedadAmb.cliente->connected())   mqttHumedadAmb.cliente->loop();
-  if (mqttHumedadSuelo.cliente && mqttHumedadSuelo.cliente->connected()) mqttHumedadSuelo.cliente->loop();
 }
 
 #endif  // MQTT_BROKER_URL
@@ -263,7 +275,11 @@ bool enviarPorHttp(const char* codigoSensor, float valor, const char* unidad,
 
   HTTPClient http;
   const String url = String(BACKEND_URL) + "/api/lecturas-iot";
-  http.begin(url);
+  if (url.startsWith("https://")) {
+    http.begin(url, RAICES_CA_PEM);  // verifica el certificado de la API
+  } else {
+    http.begin(url);                  // solo desarrollo, en la red local
+  }
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Api-Key", IOT_API_KEY);
   http.setTimeout(10000);
@@ -383,10 +399,13 @@ void setup() {
 void loop() {
   conectarWifi(); // no-op si ya esta conectado; reintenta si se cayo
 
+  if (WiFi.status() == WL_CONNECTED) {
+    // Si al arrancar no habia WiFi, el reloj y MQTT quedaron sin preparar.
+    if (timestampIso8601Utc().isEmpty()) sincronizarReloj();
 #ifdef MQTT_BROKER_URL
-  // PubSubClient necesita loop() periodico para keepalive y ACKs de QoS 1.
-  loopMqtt();
+    if (!mqttInicializado) inicializarMqtt();
 #endif
+  }
 
   if (WiFi.status() == WL_CONNECTED) {
     leerYEnviarDht();

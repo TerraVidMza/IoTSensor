@@ -19,7 +19,7 @@ Firmware de los nodos de telemetría del ERP agrícola TerraVid: sensores de tem
 
 > **Canales de telemetría:** el firmware soporta dos transportes:
 >
-> - **MQTT** (preferido): cada sensor tiene su propio usuario y contraseña en el broker Mosquitto, generados por el backend ([D-026](../../Backend/docs/DECISIONS.md)). La identidad la da el tópico (`terravid/sensores/{codigo}/lecturas`), no el payload. Un nodo comprometido no puede publicar como otro sensor.
+> - **MQTT** (preferido): cada sensor tiene su propio usuario y contraseña en el broker Mosquitto, generados por el backend ([D-026](../../Backend/docs/DECISIONS.md)). La identidad la da el tópico (`terravid/sensores/{codigo}/lecturas`), no el payload. Un nodo comprometido no puede publicar como otro sensor. El firmware verifica el certificado TLS del broker y de la API contra las raíces de Let's Encrypt (`include/certificados_ca.h`).
 > - **HTTP** (respaldo): `POST /api/lecturas-iot` con `X-Api-Key` estático, como implementa HU-19. Se activa automáticamente si el broker no está configurado o no responde.
 >
 > Ver [`docs/IOT-MQTT-FIRMWARE.md`](docs/IOT-MQTT-FIRMWARE.md) para el aprovisionamiento de credenciales MQTT y [`docs/IOT-MQTT.md`](../../Backend/docs/IOT-MQTT.md) del Backend para el contrato de mensajes.
@@ -96,3 +96,12 @@ activan poniendo su `CODIGO_SENSOR_*` en `.env`.
 ## Contribuir
 
 Ver [`CONTRIBUTING.md`](CONTRIBUTING.md) para la política de branching (Gitflow) del proyecto.
+
+
+## Verificación (2026-10-06)
+
+- El firmware compila con PlatformIO (`esp32dev`) con MQTT y sin MQTT (solo HTTP).
+- El simulador probado de punta a punta contra el backend y Mosquitto locales:
+  las lecturas publicadas por MQTT llegan al backend, y una contraseña
+  incorrecta o un tópico ajeno se detectan y caen a HTTP.
+- Falta probar el firmware en un ESP32 real contra el broker de producción.
