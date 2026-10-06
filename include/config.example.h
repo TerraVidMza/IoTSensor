@@ -56,17 +56,30 @@
 #define CODIGO_SENSOR_HUMEDAD_AMBIENTE "NODO01-HUM-AMB"
 #define CODIGO_SENSOR_HUMEDAD_SUELO "NODO01-HUM-SUELO"
 
-// --- Pines ---
-#define PIN_DHT22 4          // GPIO al pin DATA del DHT22
-#define PIN_HUMEDAD_SUELO 34 // GPIO ADC (entrada analogica) al sensor capacitivo
+// --- Sensores conectados ---
+// Poner en 0 el que todavia no este cableado. Con un sensor desconectado la
+// entrada analogica flota y se mandarian valores al azar como mediciones.
+// Con los dos en 0 el nodo solo hace el autodiagnostico de arranque (WiFi,
+// reloj y credenciales MQTT) y no publica nada.
+#define SENSOR_DHT22_CONECTADO 1
+#define SENSOR_SUELO_CONECTADO 1
 
-// --- Calibracion del sensor de humedad de suelo capacitivo ---
-// Lectura analogica cruda (0-4095 en el ADC del ESP32) en seco total y en
-// agua/tierra saturada. Varia segun el sensor y la humedad del suelo local:
-// calibrar sumergiendo la sonda en agua (ADC_HUMEDAD_SUELO_EMPAPADO) y
-// dejandola al aire seco (ADC_HUMEDAD_SUELO_SECO) antes de instalarla.
+// --- Pines y calibracion, segun la placa ---
+#if defined(ESP8266)
+// NodeMCU v1.0 (ESP-12E). GPIO 4 esta rotulado "D2" en la placa.
+#define PIN_DHT22 4           // D2 -> DATA del DHT22
+#define PIN_HUMEDAD_SUELO A0  // unica entrada analogica (0-1023, admite 0-3,3 V)
+// Lectura cruda en seco y en agua. Calibrar con el sensor real: anotar el
+// valor que muestra el monitor serie con la sonda al aire y sumergida.
+#define ADC_HUMEDAD_SUELO_SECO 800
+#define ADC_HUMEDAD_SUELO_EMPAPADO 300
+#else
+// ESP32
+#define PIN_DHT22 4           // GPIO 4 -> DATA del DHT22
+#define PIN_HUMEDAD_SUELO 34  // GPIO ADC (entrada analogica, 0-4095)
 #define ADC_HUMEDAD_SUELO_SECO 3200
 #define ADC_HUMEDAD_SUELO_EMPAPADO 1200
+#endif
 
 // --- Intervalo entre lecturas (ms) ---
 // HU-19 no exige tiempo real estricto; 5 minutos alcanza para telemetria

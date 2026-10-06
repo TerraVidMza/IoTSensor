@@ -1,4 +1,6 @@
-# Guía Completa de Configuración: Nodo IoT TerraVid (ESP32)
+# Guía Completa de Configuración: Nodo IoT TerraVid (ESP32 / ESP8266)
+
+> **NodeMCU (ESP8266):** el firmware también compila para `nodemcuv2`. El cableado para esa placa (DHT22 en **D2**, sensor de suelo en **A0**, todo a **3V3**) y el autodiagnóstico de arranque están en el [README](../README.md#placas-y-cableado). Grabar con `pio run -e nodemcuv2 -t upload`.
 
 Esta guía detalla el proceso completo paso a paso para ensamblar, configurar, calibrar y poner en marcha un nodo físico de telemetría IoT para el sistema TerraVid.
 
