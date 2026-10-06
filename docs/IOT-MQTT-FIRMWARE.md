@@ -131,15 +131,29 @@ python simulador.py --transport http    # fuerza HTTP
 python simulador.py --transport mqtt --once   # una tanda por MQTT
 ```
 
-## Nota sobre TLS en desarrollo local
+## TLS
 
-Para el broker local (`mqtt://`) no hace falta TLS. Para producción
-(`mqtts://`), el certificado de Let's Encrypt se valida contra las CA raíz del
-sistema en el simulador, y contra `setInsecure()` en el ESP32 para simplificar
-el aprovisionamiento.
+- **Broker local** (`mqtt://`): sin TLS, solo para desarrollo en la red local.
+- **Producción** (`mqtts://`):
+  - El **ESP32 verifica el certificado** contra las raíces de Let's Encrypt
+    (ISRG Root X1 y X2) que trae `include/certificados_ca.h`. Lo mismo vale para
+    el respaldo HTTPS. Antes usaba `setInsecure()`, que acepta cualquier
+    certificado: alguien en el camino podía hacerse pasar por el broker y
+    quedarse con la contraseña del sensor.
+  - El **simulador** usa las CA del sistema (o `MQTT_CA_CERT`).
+  - Si Let's Encrypt cambia de raíz hay que actualizar `certificados_ca.h` y
+    volver a grabar el firmware. Vencimientos: X1 en 2035, X2 en 2040.
 
-**Para validación estricta en el ESP32** (recomendado en producción) se puede
-poner el PEM de ISRG Root X1 en una variable de `config.h` y pasarlo a
-`WiFiClientSecure::setCACert()`. La ventaja es que detecta si el certificado
-del broker fue reemplazado; la desventaja es que hay que actualizar el firmware
-cuando Let's Encrypt cambie de CA raíz.
+## Cómo envía el firmware
+
+- En cada ciclo (5 minutos), cada sensor **se conecta, publica y se
+  desconecta**. Mantener la conexión abierta no sirve: el nodo duerme mucho más
+  que el keepalive, el broker la cierra, y un `publish()` sobre una conexión
+  muerta puede devolver éxito sin que el dato llegue.
+- **QoS 0.** PubSubClient no publica con QoS 1. Después de publicar, el
+  firmware procesa la respuesta del broker; si la conexión se cortó (por
+  ejemplo, porque la ACL rechazó el tópico), lo cuenta como falla y manda la
+  lectura por HTTP.
+- El simulador usa **MQTT 5 con QoS 1**. Con MQTT 5 el broker informa en el
+  PUBACK si rechazó la publicación ("Not authorized"); con 3.1.1 la confirmaba
+  igual y la descartaba en silencio.
