@@ -9,11 +9,11 @@ Firmware de los nodos de telemetría del ERP agrícola TerraVid: sensores de tem
 | [`Backend`](https://github.com/TerraVidMza/Backend) | API REST — NestJS + TypeORM + PostgreSQL/PostGIS |
 | [`Web`](https://github.com/TerraVidMza/Web) | Frontend web de oficina |
 | [`Mobile`](https://github.com/TerraVidMza/Mobile) | App móvil offline-first para campo |
-| [`IoTSensor`](https://github.com/TerraVidMza/IoTSensor) (este repo) | Firmware de los nodos de telemetría (ESP32) |
+| [`IoTSensor`](https://github.com/TerraVidMza/IoTSensor) (este repo) | Firmware de los nodos de telemetría (ESP32 y ESP8266) |
 
 ## Stack
 
-- **C++ (Arduino Framework)** sobre **ESP32** (WROOM/S3), vía [PlatformIO](https://platformio.org/)
+- **C++ (Arduino Framework)** sobre **ESP32** (WROOM) o **ESP8266** (NodeMCU v1.0 / ESP-12E), vía [PlatformIO](https://platformio.org/)
 - Sensores: **DHT22** (temperatura + humedad ambiente) y sensor de **humedad de suelo capacitivo** (salida analógica)
 - Transmisión: **MQTTS (TLS, puerto 8883)** como canal preferido + **HTTP/HTTPS + API Key** como respaldo
 
@@ -38,16 +38,33 @@ Flujo de cada ciclo del firmware:
 4. Envía cada lectura por **MQTT** (si `MQTT_BROKER_URL` está configurado) o por **HTTP** como respaldo.
 5. Espera `INTERVALO_LECTURA_MS` (5 minutos por defecto) y repite.
 
-## Wiring (ESP32 WROOM-32)
+## Placas y cableado
 
-| Sensor | Pin sensor | Pin ESP32 (default en `config.example.h`) |
+El mismo código compila para dos placas; se elige con el entorno de PlatformIO.
+
+| | ESP32 (`esp32dev`) | ESP8266 — NodeMCU v1.0 (`nodemcuv2`) |
 |---|---|---|
-| DHT22 — DATA | DATA | GPIO 4 (con resistencia pull-up de 10kΩ a 3.3V si el módulo no la trae integrada) |
-| DHT22 — VCC / GND | VCC / GND | 3.3V / GND |
-| Humedad de suelo capacitivo — AOUT | salida analógica | GPIO 34 (entrada ADC, *input-only*, no soporta pull-up interno) |
-| Humedad de suelo capacitivo — VCC / GND | VCC / GND | 3.3V / GND |
+| DHT22 — DATA | GPIO 4 | **D2** (GPIO 4) |
+| DHT22 — VCC / GND | 3V3 / GND | **3V3** / **G** |
+| Suelo capacitivo — AOUT | GPIO 34 (ADC 0–4095) | **A0** (ADC 0–1023) |
+| Suelo capacitivo — VCC / GND | 3V3 / GND | **3V3** / **G** |
 
-Los pines son configurables en `config.h` (`PIN_DHT22`, `PIN_HUMEDAD_SUELO`).
+- El DHT22 necesita una resistencia *pull-up* de 10 kΩ entre DATA y 3V3. Los
+  módulos de 3 pines ya la traen; el sensor suelto de 4 pines, no.
+- Alimentar los sensores con **3,3 V, no con 5 V**: con 5 V la salida del
+  sensor de suelo puede superar lo que admite la entrada analógica.
+- En el ESP8266 no usar D3, D4 ni D8 para sensores: definen el modo de
+  arranque de la placa.
+- **DHT22 o DHT11:** el firmware sirve para los dos; se elige con `TIPO_DHT`
+  en `config.h`. Se ven parecidos (el DHT22 suele ser blanco, el DHT11 azul)
+  pero el protocolo cambia: con el modelo equivocado *todas* las lecturas dan
+  "Lectura del DHT invalida", aunque el cableado esté bien. El DHT11 es menos
+  preciso (0–50 °C, 20–90 % de humedad, resolución de 1 °C / 1 %).
+- Sensor sin cablear: ponerlo en `0` en `config.h` (`SENSOR_DHT22_CONECTADO`,
+  `SENSOR_SUELO_CONECTADO`). Si no, la entrada analógica flota y se mandarían
+  valores al azar como si fueran mediciones.
+
+Los pines y la calibración se definen por placa en `config.h`.
 
 ## Puesta en marcha (con hardware)
 
@@ -63,7 +80,8 @@ Los pines son configurables en `config.h` (`PIN_DHT22`, `PIN_HUMEDAD_SUELO`).
 3. Calibrar el sensor de humedad de suelo (varía por unidad): sumergido en agua anotar el valor de `ADC_HUMEDAD_SUELO_EMPAPADO`, seco al aire anotar `ADC_HUMEDAD_SUELO_SECO`, y cargar ambos en `config.h`. Se puede leer el valor crudo por el monitor serie antes de calibrar.
 4. Compilar y flashear:
    ```bash
-   pio run --target upload
+   pio run -e esp32dev  -t upload     # ESP32
+   pio run -e nodemcuv2 -t upload     # ESP8266 / NodeMCU
    pio device monitor
    ```
 
@@ -100,8 +118,29 @@ Ver [`CONTRIBUTING.md`](CONTRIBUTING.md) para la política de branching (Gitflow
 
 ## Verificación (2026-10-06)
 
-- El firmware compila con PlatformIO (`esp32dev`) con MQTT y sin MQTT (solo HTTP).
+- El firmware compila con PlatformIO para `esp32dev` y `nodemcuv2`, con MQTT y sin MQTT (solo HTTP).
 - El simulador probado de punta a punta contra el backend y Mosquitto locales:
   las lecturas publicadas por MQTT llegan al backend, y una contraseña
   incorrecta o un tópico ajeno se detectan y caen a HTTP.
-- Falta probar el firmware en un ESP32 real contra el broker de producción.
+- **NodeMCU v1.0 (ESP8266) real contra producción:** WiFi, NTP, TLS verificado
+  contra `terravid-api.duckdns.org:8883` y las tres credenciales MQTT aceptadas
+  por el broker (autodiagnóstico de arranque). Memoria libre estable en ~34 KB
+  después de cada handshake TLS.
+- **Primera lectura real (2026-10-07):** NodeMCU con un DHT11 en D2 publicó
+  `NODO01-TEMP = 24.90 °C` y `NODO01-HUM-AMB = 38.00 %` por MQTT al broker de
+  producción. El sensor de humedad de suelo todavía no está conectado
+  (`SENSOR_SUELO_CONECTADO 0`); falta cablearlo y calibrarlo.
+
+## Autodiagnóstico de arranque
+
+Al conectarse, el nodo verifica cada credencial MQTT conectándose al broker
+**sin publicar nada**, y lo informa por el monitor serie:
+
+```
+Verificando credenciales MQTT (sin publicar)...
+  [NODO01-TEMP] OK: el broker acepto la credencial
+  [NODO01-HUM-AMB] broker rechazo la conexion: no autorizado (credencial inexistente o deshabilitada) (estado=5)
+```
+
+Sirve para instalar el nodo antes de cablear los sensores y para detectar una
+credencial regenerada en la Web y no actualizada en `config.h`.
