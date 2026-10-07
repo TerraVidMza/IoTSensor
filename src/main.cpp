@@ -5,6 +5,12 @@
 // al backend por MQTT (si MQTT_BROKER_URL esta definido en config.h) o por
 // HTTP como respaldo.
 //
+// Placas soportadas (platformio.ini):
+//   - esp32dev   (ESP32)
+//   - nodemcuv2  (ESP8266, NodeMCU v1.0 / ESP-12E)
+// Lo que cambia entre las dos (librerias WiFi/TLS, pines, ADC) esta aislado en
+// la seccion "Plataforma" de abajo; el resto del codigo es comun.
+//
 // Transporte preferido: MQTTS (TLS, puerto 8883). El broker Mosquitto usa
 // dynamic security (D-026): cada sensor tiene su propio usuario y password y
 // solo puede publicar en su topico. Un nodo con 3 sensores usa 3 credenciales.
@@ -32,8 +38,6 @@
 //   Respuestas: 201 ingerida | 404 sensor no registrado | 403 sensor inactivo
 
 #include <Arduino.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <DHT.h>
 #include <time.h>
@@ -41,12 +45,57 @@
 #include "config.h"
 #include "certificados_ca.h"
 
-#ifdef MQTT_BROKER_URL
+// =============================================================================
+// Plataforma
+// =============================================================================
+
+#if defined(ESP8266)
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecureBearSSL.h>
+using ClienteTls = BearSSL::WiFiClientSecure;
+// El ESP8266 tiene una sola entrada analogica (A0) de 10 bits.
+static const int ADC_MAXIMO = 1023;
+#elif defined(ESP32)
+#include <WiFi.h>
+#include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+using ClienteTls = WiFiClientSecure;
+static const int ADC_MAXIMO = 4095;
+#else
+#error "Placa no soportada: usar un entorno de platformio.ini (esp32dev o nodemcuv2)"
+#endif
+
+// Sensores conectados. Con un sensor sin cablear, la entrada analogica flota y
+// el firmware mandaria valores al azar como si fueran mediciones: por eso cada
+// sensor se habilita explicitamente en config.h. Sin definir, se asume que esta.
+#ifndef SENSOR_DHT22_CONECTADO
+#define SENSOR_DHT22_CONECTADO 1
+#endif
+#ifndef SENSOR_SUELO_CONECTADO
+#define SENSOR_SUELO_CONECTADO 1
+#endif
+
+/** Prepara un cliente TLS para verificar contra las raices de Let's Encrypt. */
+void configurarTls(ClienteTls& cliente) {
+#if defined(ESP8266)
+  // BearSSL guarda un puntero a la lista: tiene que vivir todo el programa.
+  static BearSSL::X509List raices(RAICES_CA_PEM);
+  cliente.setTrustAnchors(&raices);
+#else
+  cliente.setCACert(RAICES_CA_PEM);
+#endif
+}
+
+#ifdef MQTT_BROKER_URL
 #include <PubSubClient.h>
 #endif
 
-DHT dht(PIN_DHT22, DHT22);
+#ifndef TIPO_DHT
+#define TIPO_DHT DHT22
+#endif
+
+DHT dht(PIN_DHT22, TIPO_DHT);
 
 // --- Conexion WiFi ---
 
@@ -67,41 +116,51 @@ void conectarWifi() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\nWiFi conectado. IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("\nWiFi conectado. IP: %s  RSSI: %d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
   } else {
-    Serial.println("\nNo se pudo conectar a WiFi. Se reintentara en el proximo ciclo.");
+    Serial.println("\nNo se pudo conectar a WiFi (revisar SSID/password; solo 2,4 GHz). Se reintentara en el proximo ciclo.");
   }
 }
 
 // --- Reloj (NTP) ---
 //
 // El backend persiste sensorTimestamp tal cual lo manda el nodo, sin
-// corregirlo (HU-19): si el reloj del ESP32 no esta sincronizado, el dato de
-// telemetria queda con una fecha incorrecta de forma silenciosa. Se sincroniza
-// una vez al boot contra servidores NTP publicos, en UTC.
+// corregirlo (HU-19): si el reloj no esta sincronizado, el dato de telemetria
+// queda con una fecha incorrecta de forma silenciosa. Ademas TLS necesita la
+// hora para validar el certificado. Se sincroniza en UTC.
+
+static const time_t EPOCH_VALIDA = 1600000000;  // 2020-09: antes de esto, sin sincronizar
+
+bool relojSincronizado() {
+  return time(nullptr) > EPOCH_VALIDA;
+}
+
 bool sincronizarReloj() {
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
   Serial.print("Sincronizando reloj (NTP)...");
-  struct tm horaActual;
   const unsigned long inicio = millis();
-  while (!getLocalTime(&horaActual, 1000) && millis() - inicio < 15000) {
+  while (!relojSincronizado() && millis() - inicio < 15000) {
+    delay(500);
     Serial.print(".");
   }
 
-  const bool sincronizado = horaActual.tm_year > (2020 - 1900);
+  const bool sincronizado = relojSincronizado();
   Serial.println(sincronizado ? " listo." : " fallo, se reintentara.");
   return sincronizado;
 }
 
 String timestampIso8601Utc() {
-  struct tm horaActual;
-  if (!getLocalTime(&horaActual, 100)) {
+  if (!relojSincronizado()) {
     // Sin reloj sincronizado no hay forma de dar una fecha real: se marca el
     // dato para no reportar un timestamp epoch (1970) que arruina el
     // historial (HU-20) y las series de HU-29.
     return "";
   }
+  const time_t ahora = time(nullptr);
+  struct tm horaActual;
+  gmtime_r(&ahora, &horaActual);
   char buffer[25];
   strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &horaActual);
   return String(buffer);
@@ -123,7 +182,7 @@ struct ClienteMqtt {
 
   const char* usuario;
   const char* password;
-  WiFiClientSecure clienteSeguro;
+  ClienteTls clienteSeguro;
   WiFiClient clientePlano;
   PubSubClient* cliente = nullptr;
 };
@@ -168,17 +227,18 @@ void inicializarClienteMqtt(ClienteMqtt& cm) {
     // Verifica el certificado del broker contra las raices de Let's Encrypt:
     // con setInsecure() cualquiera en el camino podia hacerse pasar por el
     // broker y quedarse con la contrasena del sensor.
-    cm.clienteSeguro.setCACert(RAICES_CA_PEM);
+    configurarTls(cm.clienteSeguro);
     cm.cliente = new PubSubClient(cm.clienteSeguro);
   } else {
     cm.cliente = new PubSubClient(cm.clientePlano);
   }
   cm.cliente->setServer(mqttHost.c_str(), mqttPuerto);
   cm.cliente->setKeepAlive(30);
-  cm.cliente->setSocketTimeout(10);
+  // El handshake TLS en un ESP8266 tarda un par de segundos.
+  cm.cliente->setSocketTimeout(15);
 }
 
-/** Inicializa todos los clientes MQTT. Se llama una vez en setup(). */
+/** Inicializa todos los clientes MQTT. */
 void inicializarMqtt() {
   if (!parsearBrokerUrl(MQTT_BROKER_URL, mqttHost, mqttPuerto, mqttUsaTls)) {
     Serial.printf("MQTT_BROKER_URL invalida: \"%s\". Se usara solo HTTP.\n", MQTT_BROKER_URL);
@@ -193,8 +253,22 @@ void inicializarMqtt() {
   mqttInicializado = true;
 }
 
+/** Texto del estado de PubSubClient, para el monitor serie. */
+const char* describirEstadoMqtt(int estado) {
+  switch (estado) {
+    case -4: return "sin respuesta del broker (timeout)";
+    case -3: return "conexion perdida";
+    case -2: return "no se pudo abrir la conexion (red, puerto 8883 o certificado TLS)";
+    case -1: return "desconectado";
+    case 0:  return "conectado";
+    case 4:  return "usuario o contrasena incorrectos";
+    case 5:  return "no autorizado (credencial inexistente o deshabilitada)";
+    default: return "rechazado por el broker";
+  }
+}
+
 /**
- * Conecta (o reconecta) un cliente MQTT al broker.
+ * Conecta un cliente MQTT al broker, siempre de cero.
  * Cada sensor se autentica con su propio usuario: el broker lo limita
  * a publicar solo en su topico (D-026).
  */
@@ -207,10 +281,31 @@ bool conectarClienteMqtt(ClienteMqtt& cm) {
   const String clientId = String(cm.usuario) + "-" + String(random(0xffff), HEX);
   const bool ok = cm.cliente->connect(clientId.c_str(), cm.usuario, cm.password);
   if (!ok) {
-    Serial.printf("  [%s] broker rechazo la conexion (estado=%d)\n",
-                  cm.usuario, cm.cliente->state());
+    const int estado = cm.cliente->state();
+    Serial.printf("  [%s] broker rechazo la conexion: %s (estado=%d)\n",
+                  cm.usuario, describirEstadoMqtt(estado), estado);
   }
   return ok;
+}
+
+/**
+ * Autodiagnostico de arranque: verifica que cada credencial MQTT sea aceptada
+ * por el broker, sin publicar nada. Permite probar la placa sin sensores y sin
+ * mandar mediciones falsas al backend.
+ */
+void verificarCredencialesMqtt() {
+  if (!mqttInicializado) return;
+  Serial.println("Verificando credenciales MQTT (sin publicar)...");
+  ClienteMqtt* clientes[] = { &mqttTemperatura, &mqttHumedadAmb, &mqttHumedadSuelo };
+  for (ClienteMqtt* cm : clientes) {
+    if (conectarClienteMqtt(*cm)) {
+      Serial.printf("  [%s] OK: el broker acepto la credencial\n", cm->usuario);
+      cm->cliente->disconnect();
+    }
+#if defined(ESP8266)
+    Serial.printf("  memoria libre: %u bytes\n", ESP.getFreeHeap());
+#endif
+  }
 }
 
 /**
@@ -273,13 +368,26 @@ bool enviarPorHttp(const char* codigoSensor, float valor, const char* unidad,
   String cuerpo;
   serializeJson(payload, cuerpo);
 
-  HTTPClient http;
   const String url = String(BACKEND_URL) + "/api/lecturas-iot";
+  HTTPClient http;
+#if defined(ESP8266)
+  // En el ESP8266 el cliente de red se pasa explicito y vive mientras dure
+  // el request.
+  ClienteTls clienteSeguro;
+  WiFiClient clientePlano;
+  if (url.startsWith("https://")) {
+    configurarTls(clienteSeguro);
+    http.begin(clienteSeguro, url);
+  } else {
+    http.begin(clientePlano, url);  // solo desarrollo, en la red local
+  }
+#else
   if (url.startsWith("https://")) {
     http.begin(url, RAICES_CA_PEM);  // verifica el certificado de la API
   } else {
     http.begin(url);                  // solo desarrollo, en la red local
   }
+#endif
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Api-Key", IOT_API_KEY);
   http.setTimeout(10000);
@@ -295,8 +403,8 @@ bool enviarPorHttp(const char* codigoSensor, float valor, const char* unidad,
     return true;
   }
 
-  // 404 (sensor no dado de alta), 403 (sensor inactivo) y 400 (fuera de rango
-  // fisico) son errores de configuracion o de calibracion, no de red.
+  // 404 (sensor no dado de alta), 403 (sensor inactivo), 401 (API key) y 400
+  // (fuera de rango fisico) son errores de configuracion, no de red.
   Serial.printf("  Respuesta: %s\n", respuesta.c_str());
   return false;
 }
@@ -334,11 +442,21 @@ bool enviarLectura(
 // --- Lecturas por variable ---
 
 void leerYEnviarDht() {
-  const float temperatura = dht.readTemperature();
-  const float humedad = dht.readHumidity();
+  // El DHT22 falla una lectura de vez en cuando (timing del protocolo de un
+  // hilo, sobre todo justo despues del WiFi). Se reintenta respetando los
+  // 2 s minimos que pide el sensor entre lecturas.
+  float temperatura = NAN;
+  float humedad = NAN;
+  for (int intento = 1; intento <= 3; intento++) {
+    temperatura = dht.readTemperature(false, true);
+    humedad = dht.readHumidity();
+    if (!isnan(temperatura) && !isnan(humedad)) break;
+    Serial.printf("DHT: lectura %d fallida.\n", intento);
+    if (intento < 3) delay(2500);
+  }
 
   if (isnan(temperatura) || isnan(humedad)) {
-    Serial.println("Lectura de DHT22 invalida (revisar cableado/PIN_DHT22).");
+    Serial.println("Lectura del DHT invalida (revisar cableado, PIN_DHT22 y TIPO_DHT).");
     return;
   }
 
@@ -363,6 +481,7 @@ void leerYEnviarHumedadSuelo() {
   // la calibracion de config.h no cubre exactamente el rango observado.
   long porcentaje = map(lecturaCruda, ADC_HUMEDAD_SUELO_SECO, ADC_HUMEDAD_SUELO_EMPAPADO, 0, 100);
   porcentaje = constrain(porcentaje, 0, 100);
+  Serial.printf("Humedad de suelo: ADC=%d/%d -> %ld %%\n", lecturaCruda, ADC_MAXIMO, porcentaje);
 
   enviarLectura(
 #ifdef MQTT_BROKER_URL
@@ -373,43 +492,57 @@ void leerYEnviarHumedadSuelo() {
 
 // --- Ciclo principal ---
 
+void prepararConexiones() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  // Si al arrancar no habia WiFi, el reloj y MQTT quedaron sin preparar.
+  if (!relojSincronizado()) sincronizarReloj();
+#ifdef MQTT_BROKER_URL
+  if (!mqttInicializado && relojSincronizado()) {
+    inicializarMqtt();
+    verificarCredencialesMqtt();
+  }
+#endif
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\nTerraVid IoT — arrancando nodo de telemetria");
+#if defined(ESP8266)
+  Serial.println("\nTerraVid IoT — arrancando nodo de telemetria (ESP8266)");
+#else
+  Serial.println("\nTerraVid IoT — arrancando nodo de telemetria (ESP32)");
+  analogReadResolution(12);  // ADC del ESP32: 0-4095
+#endif
 
 #ifdef MQTT_BROKER_URL
   Serial.println("Transporte: MQTT (con HTTP como respaldo)");
 #else
   Serial.println("Transporte: HTTP");
 #endif
+  Serial.printf("Sensores habilitados: %s=%s, suelo=%s\n",
+                TIPO_DHT == DHT11 ? "DHT11" : "DHT22",
+                SENSOR_DHT22_CONECTADO ? "si" : "no",
+                SENSOR_SUELO_CONECTADO ? "si" : "no");
 
+#if SENSOR_DHT22_CONECTADO
   dht.begin();
-  analogReadResolution(12); // ADC del ESP32: 0-4095
+#endif
 
   conectarWifi();
-  if (WiFi.status() == WL_CONNECTED) {
-    sincronizarReloj();
-#ifdef MQTT_BROKER_URL
-    inicializarMqtt();
-#endif
-  }
+  prepararConexiones();
 }
 
 void loop() {
   conectarWifi(); // no-op si ya esta conectado; reintenta si se cayo
+  prepararConexiones();
 
   if (WiFi.status() == WL_CONNECTED) {
-    // Si al arrancar no habia WiFi, el reloj y MQTT quedaron sin preparar.
-    if (timestampIso8601Utc().isEmpty()) sincronizarReloj();
-#ifdef MQTT_BROKER_URL
-    if (!mqttInicializado) inicializarMqtt();
-#endif
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
+#if SENSOR_DHT22_CONECTADO
     leerYEnviarDht();
+#endif
+#if SENSOR_SUELO_CONECTADO
     leerYEnviarHumedadSuelo();
+#endif
   }
 
   delay(INTERVALO_LECTURA_MS);
