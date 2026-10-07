@@ -55,6 +55,11 @@ El mismo código compila para dos placas; se elige con el entorno de PlatformIO.
   sensor de suelo puede superar lo que admite la entrada analógica.
 - En el ESP8266 no usar D3, D4 ni D8 para sensores: definen el modo de
   arranque de la placa.
+- **DHT22 o DHT11:** el firmware sirve para los dos; se elige con `TIPO_DHT`
+  en `config.h`. Se ven parecidos (el DHT22 suele ser blanco, el DHT11 azul)
+  pero el protocolo cambia: con el modelo equivocado *todas* las lecturas dan
+  "Lectura del DHT invalida", aunque el cableado esté bien. El DHT11 es menos
+  preciso (0–50 °C, 20–90 % de humedad, resolución de 1 °C / 1 %).
 - Sensor sin cablear: ponerlo en `0` en `config.h` (`SENSOR_DHT22_CONECTADO`,
   `SENSOR_SUELO_CONECTADO`). Si no, la entrada analógica flota y se mandarían
   valores al azar como si fueran mediciones.
@@ -121,7 +126,10 @@ Ver [`CONTRIBUTING.md`](CONTRIBUTING.md) para la política de branching (Gitflow
   contra `terravid-api.duckdns.org:8883` y las tres credenciales MQTT aceptadas
   por el broker (autodiagnóstico de arranque). Memoria libre estable en ~34 KB
   después de cada handshake TLS.
-- Falta conectar los sensores y ver la primera lectura real en el backend.
+- **Primera lectura real (2026-10-07):** NodeMCU con un DHT11 en D2 publicó
+  `NODO01-TEMP = 24.90 °C` y `NODO01-HUM-AMB = 38.00 %` por MQTT al broker de
+  producción. El sensor de humedad de suelo todavía no está conectado
+  (`SENSOR_SUELO_CONECTADO 0`); falta cablearlo y calibrarlo.
 
 ## Autodiagnóstico de arranque
 

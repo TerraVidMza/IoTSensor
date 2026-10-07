@@ -64,6 +64,11 @@
 #define SENSOR_DHT22_CONECTADO 1
 #define SENSOR_SUELO_CONECTADO 1
 
+// Modelo del sensor de temperatura/humedad: DHT22 (AM2302, blanco) o DHT11
+// (azul, menos preciso: 0-50 °C, 20-90 %). Se ven parecidos pero hablan un
+// protocolo distinto: con el modelo equivocado todas las lecturas fallan.
+#define TIPO_DHT DHT22
+
 // --- Pines y calibracion, segun la placa ---
 #if defined(ESP8266)
 // NodeMCU v1.0 (ESP-12E). GPIO 4 esta rotulado "D2" en la placa.

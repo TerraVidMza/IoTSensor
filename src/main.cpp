@@ -91,7 +91,11 @@ void configurarTls(ClienteTls& cliente) {
 #include <PubSubClient.h>
 #endif
 
-DHT dht(PIN_DHT22, DHT22);
+#ifndef TIPO_DHT
+#define TIPO_DHT DHT22
+#endif
+
+DHT dht(PIN_DHT22, TIPO_DHT);
 
 // --- Conexion WiFi ---
 
@@ -438,11 +442,21 @@ bool enviarLectura(
 // --- Lecturas por variable ---
 
 void leerYEnviarDht() {
-  const float temperatura = dht.readTemperature();
-  const float humedad = dht.readHumidity();
+  // El DHT22 falla una lectura de vez en cuando (timing del protocolo de un
+  // hilo, sobre todo justo despues del WiFi). Se reintenta respetando los
+  // 2 s minimos que pide el sensor entre lecturas.
+  float temperatura = NAN;
+  float humedad = NAN;
+  for (int intento = 1; intento <= 3; intento++) {
+    temperatura = dht.readTemperature(false, true);
+    humedad = dht.readHumidity();
+    if (!isnan(temperatura) && !isnan(humedad)) break;
+    Serial.printf("DHT: lectura %d fallida.\n", intento);
+    if (intento < 3) delay(2500);
+  }
 
   if (isnan(temperatura) || isnan(humedad)) {
-    Serial.println("Lectura de DHT22 invalida (revisar cableado/PIN_DHT22).");
+    Serial.println("Lectura del DHT invalida (revisar cableado, PIN_DHT22 y TIPO_DHT).");
     return;
   }
 
@@ -505,7 +519,8 @@ void setup() {
 #else
   Serial.println("Transporte: HTTP");
 #endif
-  Serial.printf("Sensores habilitados: DHT22=%s, suelo=%s\n",
+  Serial.printf("Sensores habilitados: %s=%s, suelo=%s\n",
+                TIPO_DHT == DHT11 ? "DHT11" : "DHT22",
                 SENSOR_DHT22_CONECTADO ? "si" : "no",
                 SENSOR_SUELO_CONECTADO ? "si" : "no");
 
